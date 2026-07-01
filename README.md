@@ -21,6 +21,10 @@ now, but who *was* here recently and dropped off.
 - Zero runtime dependencies — pure Python 3 standard library
 - Single static HTML file output, so it works with whatever web server is
   already running on the box (e.g. the lighttpd instance Pi-hole ships with)
+- Flags decoy ARP replies as **suspicious** instead of trusting them (e.g.
+  the network address itself appearing as a "host", or MACs from an IEEE
+  OUI block unused since the early 1980s) — those rows are excluded from
+  persistent tracking so they can't bloat state.json
 
 ## Requirements
 

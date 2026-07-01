@@ -27,6 +27,12 @@ DEFAULT_RETENTION_DAYS = int(os.environ.get("NETSCAN_RETENTION_DAYS", "30"))
 DEFAULT_REFRESH_MINUTES = int(os.environ.get("NETSCAN_REFRESH_MINUTES", "15"))
 NMAP_TIMEOUT = 120  # seconds
 
+# MAC prefixes from IEEE's earliest (early-1980s) OUI block. Real modern
+# consumer/IoT hardware essentially never carries one of these — seeing them
+# is a strong signal of decoy ARP replies from anti-scanning network gear,
+# not real devices.
+SUSPICIOUS_MAC_PREFIX = "00:00:"
+
 # --- helpers -------------------------------------------------------------
 
 
@@ -69,7 +75,14 @@ def run_scan(subnet):
     return ET.fromstring(result.stdout)
 
 
-def parse_hosts(root):
+def is_suspicious_mac(mac):
+    return bool(mac) and mac.lower().startswith(SUSPICIOUS_MAC_PREFIX)
+
+
+def parse_hosts(root, subnet):
+    net = ipaddress.ip_network(subnet, strict=False)
+    invalid_ips = {str(net.network_address), str(net.broadcast_address)}
+
     devices = []
     for host in root.findall("host"):
         status = host.find("status")
@@ -91,9 +104,15 @@ def parse_hosts(root):
             if hn is not None:
                 hostname = hn.get("name")
 
-        if ip:
+        if ip and ip not in invalid_ips:
             devices.append(
-                {"ip": ip, "hostname": hostname or "", "mac": mac or "", "vendor": vendor or ""}
+                {
+                    "ip": ip,
+                    "hostname": hostname or "",
+                    "mac": mac or "",
+                    "vendor": vendor or "",
+                    "suspicious": is_suspicious_mac(mac),
+                }
             )
     return devices
 
@@ -114,6 +133,8 @@ def save_state(state, state_path):
 
 
 def update_state(state, seen_devices, now, retention_days):
+    """Only ever called with non-suspicious devices — decoy MACs rotate every
+    scan and would otherwise bloat state.json with junk entries forever."""
     now_str = now.strftime(TS_FMT)
     seen_keys = set()
 
@@ -149,7 +170,8 @@ def update_state(state, seen_devices, now, retention_days):
     return state
 
 
-def render_html(state, subnet, scan_seconds, now, refresh_minutes):
+def render_html(state, subnet, scan_seconds, now, refresh_minutes, suspicious_devices=None):
+    suspicious_devices = suspicious_devices or []
     devices = list(state.values())
     online = sorted(
         (d for d in devices if d["status"] == "online"),
@@ -160,27 +182,39 @@ def render_html(state, subnet, scan_seconds, now, refresh_minutes):
         key=lambda d: d["last_seen"],
         reverse=True,
     )
-    ordered = online + offline
+    now_str = now.strftime(TS_FMT)
+    suspicious = sorted(suspicious_devices, key=lambda d: ipaddress.ip_address(d["ip"]))
+    ordered = online + suspicious + offline
 
     def esc(v):
         return html.escape(v) if v else '<span class="muted">&mdash;</span>'
 
     rows = []
     for d in ordered:
-        badge_class = "online" if d["status"] == "online" else "offline"
+        status = "suspicious" if d.get("suspicious") else d.get("status", "online")
+        last_seen = d.get("last_seen", now_str)
         rows.append(
             "      <tr>"
-            f'<td><span class="badge {badge_class}">{d["status"]}</span></td>'
+            f'<td><span class="badge {status}">{status}</span></td>'
             f'<td class="ip">{esc(d["ip"])}</td>'
             f'<td>{esc(d["hostname"])}</td>'
             f'<td class="mac">{esc(d["mac"])}</td>'
             f'<td>{esc(d["vendor"])}</td>'
-            f'<td class="muted">{esc(d["last_seen"])}</td>'
+            f'<td class="muted">{esc(last_seen)}</td>'
             "</tr>"
         )
     rows_html = "\n".join(rows) if rows else '      <tr><td colspan="6" class="muted">No devices found</td></tr>'
 
-    now_str = now.strftime(TS_FMT)
+    warning_html = ""
+    if suspicious:
+        warning_html = (
+            '  <div class="warning">'
+            f"&#9888; {len(suspicious)} result(s) below have MAC addresses from a decades-obsolete "
+            "vendor block that real modern devices don't use. This usually means something on the "
+            "network is returning fake ARP replies &mdash; those rows are marked "
+            "<strong>suspicious</strong> and are not trustworthy."
+            "</div>\n"
+        )
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -218,11 +252,23 @@ def render_html(state, subnet, scan_seconds, now, refresh_minutes):
   }}
   .stat.online {{ background: #16301f; color: #4ade80; }}
   .stat.offline {{ background: #2a1c1c; color: #f2a3a3; }}
+  .stat.suspicious {{ background: #362615; color: #f2c14e; }}
   .meta {{
     color: #8b93a3;
     font-size: 0.82rem;
     margin: 0 auto 1.5rem;
     max-width: 1000px;
+  }}
+  .warning {{
+    max-width: 1000px;
+    margin: 0 auto 1.5rem;
+    background: #362615;
+    border: 1px solid #5a4420;
+    color: #f2c14e;
+    border-radius: 8px;
+    padding: 0.7rem 1rem;
+    font-size: 0.85rem;
+    line-height: 1.4;
   }}
   table {{
     width: 100%;
@@ -268,6 +314,7 @@ def render_html(state, subnet, scan_seconds, now, refresh_minutes):
   }}
   .badge.online {{ background: #16301f; color: #4ade80; }}
   .badge.offline {{ background: #2a1c1c; color: #f2a3a3; }}
+  .badge.suspicious {{ background: #362615; color: #f2c14e; }}
 </style>
 </head>
 <body>
@@ -275,6 +322,7 @@ def render_html(state, subnet, scan_seconds, now, refresh_minutes):
     <h1>Home Network Map</h1>
     <div class="stats">
       <span class="stat online">Online: {len(online)}</span>
+      {f'<span class="stat suspicious">Suspicious: {len(suspicious)}</span>' if suspicious else ''}
       <span class="stat offline">Tracked Offline: {len(offline)}</span>
     </div>
   </div>
@@ -282,7 +330,7 @@ def render_html(state, subnet, scan_seconds, now, refresh_minutes):
     Subnet {html.escape(subnet)} &middot; scan took {scan_seconds:.1f}s &middot;
     last updated {now_str} (refreshes every {refresh_minutes} min)
   </div>
-  <table>
+{warning_html}  <table>
     <thead>
       <tr><th>Status</th><th>IP Address</th><th>Hostname</th><th>MAC Address</th><th>Vendor</th><th>Last Seen</th></tr>
     </thead>
@@ -321,14 +369,17 @@ def main():
     now = datetime.now()
     root = run_scan(subnet)
     elapsed = (datetime.now() - now).total_seconds()
-    seen = parse_hosts(root)
-    log(f"Found {len(seen)} devices online in {elapsed:.1f}s")
+    seen = parse_hosts(root, subnet)
+    trustworthy = [d for d in seen if not d["suspicious"]]
+    suspicious = [d for d in seen if d["suspicious"]]
+    log(f"Found {len(trustworthy)} devices online in {elapsed:.1f}s"
+        + (f" ({len(suspicious)} suspicious, excluded from tracking)" if suspicious else ""))
 
     state = load_state(args.state_path)
-    state = update_state(state, seen, now, args.retention_days)
+    state = update_state(state, trustworthy, now, args.retention_days)
     save_state(state, args.state_path)
 
-    page = render_html(state, subnet, elapsed, now, args.refresh_minutes)
+    page = render_html(state, subnet, elapsed, now, args.refresh_minutes, suspicious_devices=suspicious)
     output_path = os.path.join(args.output_dir, "index.html")
     write_atomic(output_path, page)
     log(f"Wrote {output_path}")
