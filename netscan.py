@@ -53,6 +53,17 @@ def detect_subnet():
 def run_scan(subnet):
     cmd = ["nmap", "-sn", "-oX", "-", subnet]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=NMAP_TIMEOUT)
+
+    if result.returncode != 0 and "Failed to open device" in result.stderr:
+        # Raw Ethernet-frame injection (dnet) can fail to open the interface
+        # even as root on some hosts (VPN/security software holding the
+        # packet-capture layer). Fall back to raw-IP pings, at the cost of
+        # MAC/vendor info (which comes from ARP replies).
+        log("nmap couldn't open the network device for ARP scanning. Retrying with")
+        log("--send-ip (no MAC/vendor data)...")
+        cmd = ["nmap", "-sn", "--send-ip", "-oX", "-", subnet]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=NMAP_TIMEOUT)
+
     if result.returncode != 0:
         raise RuntimeError(f"nmap failed ({result.returncode}): {result.stderr.strip()}")
     return ET.fromstring(result.stdout)
