@@ -12,8 +12,10 @@ now, but who *was* here recently and dropped off.
 
 ## Features
 
-- ARP-based subnet sweep via `nmap -sn` — picks up IP, hostname (reverse
-  DNS), MAC address, and vendor (from the MAC OUI database)
+- ARP-based subnet sweep — prefers `arp-scan` (more reliable in practice),
+  falls back to `nmap -sn` automatically if `arp-scan` isn't installed or
+  fails. Picks up IP, MAC address, and vendor from whichever ran; hostname
+  comes from the script's own parallel reverse-DNS lookups
 - Persists state in a small JSON file keyed by MAC address, so a device's
   history survives DHCP lease changes
 - Devices that go quiet are kept as "Tracked Offline" for 30 days (configurable)
@@ -28,7 +30,7 @@ now, but who *was* here recently and dropped off.
 
 ## Requirements
 
-- Linux with `nmap` installed (the installer will install it via `apt` if missing)
+- Linux with `arp-scan` and/or `nmap` installed (the installer installs both via `apt`)
 - Python 3.7+
 - Root/cron access, since ARP-based host discovery needs raw sockets
 - A web server already serving the target output directory (Pi-hole's

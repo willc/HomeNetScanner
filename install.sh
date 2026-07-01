@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs HomeNetScanner: copies the script to /opt/homenetscanner,
-# installs nmap if missing, and registers a root cron job that runs
-# every 15 minutes.
+# installs arp-scan and nmap if missing, and registers a root cron job
+# that runs every 15 minutes.
 set -euo pipefail
 
 INSTALL_DIR="/opt/homenetscanner"
@@ -14,13 +14,18 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-if ! command -v nmap >/dev/null 2>&1; then
-  echo "Installing nmap..."
+# arp-scan is the preferred backend (more reliable than nmap's ARP mode in
+# practice); nmap is kept installed as an automatic fallback.
+MISSING=()
+command -v arp-scan >/dev/null 2>&1 || MISSING+=("arp-scan")
+command -v nmap >/dev/null 2>&1 || MISSING+=("nmap")
+if [[ ${#MISSING[@]} -gt 0 ]]; then
+  echo "Installing ${MISSING[*]}..."
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update -y
-    apt-get install -y nmap
+    apt-get install -y "${MISSING[@]}"
   else
-    echo "Could not find apt-get. Install nmap manually, then re-run this script." >&2
+    echo "Could not find apt-get. Install ${MISSING[*]} manually, then re-run this script." >&2
     exit 1
   fi
 fi

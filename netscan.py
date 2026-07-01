@@ -9,12 +9,15 @@ Raspberry Pi running Pi-hole), writing into its web root.
 """
 
 import argparse
+import concurrent.futures
 import subprocess
 import sys
 import os
 import html
 import json
 import ipaddress
+import shutil
+import socket
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
@@ -25,7 +28,9 @@ DEFAULT_STATE_PATH = os.environ.get("NETSCAN_STATE_PATH", "/opt/homenetscanner/s
 DEFAULT_SUBNET = os.environ.get("NETSCAN_SUBNET") or None
 DEFAULT_RETENTION_DAYS = int(os.environ.get("NETSCAN_RETENTION_DAYS", "30"))
 DEFAULT_REFRESH_MINUTES = int(os.environ.get("NETSCAN_REFRESH_MINUTES", "15"))
-NMAP_TIMEOUT = 120  # seconds
+SCAN_TIMEOUT = 120  # seconds
+DNS_TIMEOUT = 2.0  # seconds per reverse-lookup
+DNS_MAX_WORKERS = 16
 
 # MAC prefixes from IEEE's earliest (early-1980s) OUI block. Real modern
 # consumer/IoT hardware essentially never carries one of these — seeing them
@@ -56,9 +61,36 @@ def detect_subnet():
     raise RuntimeError("Could not auto-detect a local subnet; pass --subnet explicitly")
 
 
-def run_scan(subnet):
+def have_arp_scan():
+    return shutil.which("arp-scan") is not None
+
+
+def run_arp_scan(subnet):
+    """Preferred backend: a purpose-built ARP scanner. It's been more
+    reliable than nmap's ARP mode in practice — no raw-device-open quirks,
+    and on at least one hostile network it returned real devices where
+    nmap's ARP sweep got fed decoy replies."""
+    cmd = ["arp-scan", "--plain", subnet]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=SCAN_TIMEOUT)
+    if result.returncode != 0:
+        raise RuntimeError(f"arp-scan failed ({result.returncode}): {result.stderr.strip()}")
+
+    devices = []
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        ip, mac = parts[0].strip(), parts[1].strip()
+        vendor = parts[2].strip() if len(parts) > 2 else ""
+        if vendor.startswith("(Unknown"):
+            vendor = ""
+        devices.append({"ip": ip, "hostname": "", "mac": mac, "vendor": vendor})
+    return devices
+
+
+def run_nmap_scan(subnet):
     cmd = ["nmap", "-sn", "-oX", "-", subnet]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=NMAP_TIMEOUT)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=SCAN_TIMEOUT)
 
     if result.returncode != 0 and "Failed to open device" in result.stderr:
         # Raw Ethernet-frame injection (dnet) can fail to open the interface
@@ -68,21 +100,12 @@ def run_scan(subnet):
         log("nmap couldn't open the network device for ARP scanning. Retrying with")
         log("--send-ip (no MAC/vendor data)...")
         cmd = ["nmap", "-sn", "--send-ip", "-oX", "-", subnet]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=NMAP_TIMEOUT)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=SCAN_TIMEOUT)
 
     if result.returncode != 0:
         raise RuntimeError(f"nmap failed ({result.returncode}): {result.stderr.strip()}")
-    return ET.fromstring(result.stdout)
 
-
-def is_suspicious_mac(mac):
-    return bool(mac) and mac.lower().startswith(SUSPICIOUS_MAC_PREFIX)
-
-
-def parse_hosts(root, subnet):
-    net = ipaddress.ip_network(subnet, strict=False)
-    invalid_ips = {str(net.network_address), str(net.broadcast_address)}
-
+    root = ET.fromstring(result.stdout)
     devices = []
     for host in root.findall("host"):
         status = host.find("status")
@@ -104,17 +127,64 @@ def parse_hosts(root, subnet):
             if hn is not None:
                 hostname = hn.get("name")
 
-        if ip and ip not in invalid_ips:
-            devices.append(
-                {
-                    "ip": ip,
-                    "hostname": hostname or "",
-                    "mac": mac or "",
-                    "vendor": vendor or "",
-                    "suspicious": is_suspicious_mac(mac),
-                }
-            )
+        if ip:
+            devices.append({"ip": ip, "hostname": hostname or "", "mac": mac or "", "vendor": vendor or ""})
     return devices
+
+
+def is_suspicious_mac(mac):
+    return bool(mac) and mac.lower().startswith(SUSPICIOUS_MAC_PREFIX)
+
+
+def filter_and_flag(raw_devices, subnet):
+    """Drop the network/broadcast address (never a real host) and flag MACs
+    from the obsolete 00:00:xx OUI block as suspicious rather than trusting
+    them as real devices."""
+    net = ipaddress.ip_network(subnet, strict=False)
+    invalid_ips = {str(net.network_address), str(net.broadcast_address)}
+
+    devices = []
+    for d in raw_devices:
+        if not d["ip"] or d["ip"] in invalid_ips:
+            continue
+        devices.append({**d, "suspicious": is_suspicious_mac(d["mac"])})
+    return devices
+
+
+def resolve_hostnames(devices):
+    """Fill in any missing hostname via reverse DNS, in parallel and with a
+    short timeout so a handful of unresolvable IPs don't stall the scan."""
+    missing = [d for d in devices if not d["hostname"]]
+    if not missing:
+        return devices
+
+    def lookup(ip):
+        try:
+            socket.setdefaulttimeout(DNS_TIMEOUT)
+            return ip, socket.gethostbyaddr(ip)[0]
+        except (socket.herror, socket.gaierror, socket.timeout, OSError):
+            return ip, ""
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=DNS_MAX_WORKERS) as pool:
+        results = dict(pool.map(lookup, (d["ip"] for d in missing)))
+
+    for d in devices:
+        if not d["hostname"]:
+            d["hostname"] = results.get(d["ip"], "")
+    return devices
+
+
+def scan_network(subnet):
+    raw = None
+    if have_arp_scan():
+        try:
+            raw = run_arp_scan(subnet)
+        except Exception as e:
+            log(f"arp-scan failed ({e}); falling back to nmap...")
+    if raw is None:
+        raw = run_nmap_scan(subnet)
+    devices = filter_and_flag(raw, subnet)
+    return resolve_hostnames(devices)
 
 
 def load_state(state_path):
@@ -367,9 +437,8 @@ def main():
     subnet = args.subnet or detect_subnet()
     log(f"Scanning {subnet}")
     now = datetime.now()
-    root = run_scan(subnet)
+    seen = scan_network(subnet)
     elapsed = (datetime.now() - now).total_seconds()
-    seen = parse_hosts(root, subnet)
     trustworthy = [d for d in seen if not d["suspicious"]]
     suspicious = [d for d in seen if d["suspicious"]]
     log(f"Found {len(trustworthy)} devices online in {elapsed:.1f}s"
