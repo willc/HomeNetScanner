@@ -87,3 +87,9 @@ Each run:
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Usage
+
+```bash
+python3 main.py
+```
